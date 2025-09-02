@@ -9,6 +9,7 @@ import { config } from "../config.js";
 import { log } from "../logger.js";
 import type { ChatRequestBody, ToolStep } from "../types.js";
 import type { Tool } from "../llm/anthropic.js";
+import { runWithOpenAILLM } from "../llm/openai.js";
 
 /** Convert MCP tool metadata to Anthropic's tool schema */
 async function toolsForAnthropic(_mcpClient: any): Promise<Tool[]> {
@@ -82,7 +83,7 @@ export async function chatHandler(req: Request, res: Response) {
   let result: { text: string; steps: ToolStep[] };
   if (config.llmProvider === "mock") {
     result = await runWithMockLLM(body.messages, tools, callTool);
-  } else {
+  } else if (config.llmProvider === "anthropic") {
     if (!config.anthropicKey) {
       return res.status(500).json({ error: "ANTHROPIC_API_KEY missing" });
     }
@@ -91,6 +92,22 @@ export async function chatHandler(req: Request, res: Response) {
       tools,
       callTool,
     });
+  } else if (config.llmProvider === "openai") {
+    if (!config.openaiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY missing" });
+    }
+
+    // reuse the Anthropic-style tools and convert inside the runner
+    result = await runWithOpenAILLM(body.messages, {
+      openaiKey: config.openaiKey,
+      model: config.openaiModel,
+      tools, // <— anthropic-style tools you already build
+      callTool, // <— your existing executor (injects api_key when needed)
+    });
+  } else {
+    return res
+      .status(400)
+      .json({ error: `Unknown LLM_PROVIDER: ${config.llmProvider}` });
   }
 
   for (const s of result.steps) {

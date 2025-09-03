@@ -10,22 +10,56 @@ import { log } from "../logger.js";
 import type { ChatRequestBody, ToolStep } from "../types.js";
 import type { Tool } from "../llm/anthropic.js";
 import { runWithOpenAILLM } from "../llm/openai.js";
+import { runWithOpenRouterLLM } from "../llm/openrouter.js";
+import { convertTools } from "../llm/toolConverter.js";
 
 /** Convert MCP tool metadata to Anthropic's tool schema */
-async function toolsForAnthropic(_mcpClient: any): Promise<Tool[]> {
-  // TEMP: bypass reflection while we debug ListTools timeouts
-  const tools = [
-    {
-      name: "health",
-      description: "Liveness/readiness check",
-      input_schema: {
-        type: "object" as const, // <-- literal
-        properties: {},
-        additionalProperties: false,
-      },
-    },
-    // add others later…
-  ] satisfies Tool[]; // <-- type-satisfies
+async function toolsForAnthropic(mcpClient: any): Promise<Tool[]> {
+  const mcpToolsResponse = (await mcpClient.listTools()) || {};
+  const toolList = mcpToolsResponse.tools || [];
+
+  // --- BEGIN DEBUG LOGGING ---
+  // console.log("--- RAW TOOLS FROM MCP SERVER ---");
+  // console.log(JSON.stringify(toolList, null, 2));
+  // --- END DEBUG LOGGING ---
+
+  const tools = toolList.map((t: any) => {
+    // Use the correct source property: inputSchema
+    const schema = t.inputSchema || { type: "object", properties: {} };
+
+    // The actual tool parameters are nested inside a definition,
+    // referenced by the 'req' property.
+    if (schema.properties?.req?.$ref) {
+      const defName = schema.properties.req.$ref.split("/").pop();
+      if (defName && schema.$defs?.[defName]) {
+        const def = schema.$defs[defName];
+
+        // Now, delete the api_key from the definition's properties
+        if (def.properties?.api_key) {
+          delete def.properties.api_key;
+        }
+
+        // And remove it from the required list, if it exists
+        if (def.required) {
+          def.required = def.required.filter(
+            (prop: string) => prop !== "api_key"
+          );
+        }
+      }
+    }
+
+    return {
+      name: t.name,
+      description: t.description,
+      input_schema: schema,
+    };
+  });
+
+  // --- BEGIN DEBUG LOGGING ---
+  // console.log("--- MODIFIED TOOLS SENT TO LLM ---");
+  // console.log(JSON.stringify(tools, null, 2));
+  // --- END DEBUG LOGGING ---
+
   return tools;
 }
 
@@ -80,16 +114,18 @@ export async function chatHandler(req: Request, res: Response) {
     return out;
   };
 
+  const convertedTools = convertTools(config.llmProvider, tools);
+
   let result: { text: string; steps: ToolStep[] };
   if (config.llmProvider === "mock") {
-    result = await runWithMockLLM(body.messages, tools, callTool);
+    result = await runWithMockLLM(body.messages, convertedTools, callTool);
   } else if (config.llmProvider === "anthropic") {
     if (!config.anthropicKey) {
       return res.status(500).json({ error: "ANTHROPIC_API_KEY missing" });
     }
     result = await runWithAnthropicLLM(body.messages, {
       anthropicKey: config.anthropicKey,
-      tools,
+      tools: convertedTools,
       callTool,
     });
   } else if (config.llmProvider === "openai") {
@@ -101,7 +137,19 @@ export async function chatHandler(req: Request, res: Response) {
     result = await runWithOpenAILLM(body.messages, {
       openaiKey: config.openaiKey,
       model: config.openaiModel,
-      tools, // <— anthropic-style tools you already build
+      tools: convertedTools, // <— anthropic-style tools you already build
+      callTool, // <— your existing executor (injects api_key when needed)
+    });
+  } else if (config.llmProvider === "openrouter") {
+    if (!config.openRouterKey) {
+      return res.status(500).json({ error: "OPENROUTER_API_KEY missing" });
+    }
+
+    // reuse the Anthropic-style tools and convert inside the runner
+    result = await runWithOpenRouterLLM(body.messages, {
+      openRouterKey: config.openRouterKey,
+      model: config.openRouterModel, // pick default
+      tools: convertedTools, // <— anthropic-style tools you already build
       callTool, // <— your existing executor (injects api_key when needed)
     });
   } else {

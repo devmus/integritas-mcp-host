@@ -1,10 +1,9 @@
-// src/llm/openai.ts
+// src/llm/openrouter.ts
 import OpenAI from "openai";
 import type { ChatMessage, ToolStep } from "../types.js";
 
-
 type RunnerDeps = {
-  openaiKey: string;
+  openRouterKey: string;
   model: string;
   tools: any[]; // Anthropic-style; we convert below
   callTool: (name: string, args: Record<string, unknown>) => Promise<any>;
@@ -14,11 +13,14 @@ function toOAIMessages(messages: ChatMessage[]): any[] {
   return messages.map((m) => ({ role: m.role as any, content: m.content }));
 }
 
-export async function runWithOpenAILLM(
+export async function runWithOpenRouterLLM(
   messages: ChatMessage[],
-  { openaiKey, model, tools, callTool }: RunnerDeps
+  { openRouterKey, model, tools, callTool }: RunnerDeps
 ): Promise<{ text: string; steps: ToolStep[] }> {
-  const client = new OpenAI({ apiKey: openaiKey });
+  const client = new OpenAI({
+    apiKey: openRouterKey,
+    baseURL: "https://openrouter.ai/api/v1",
+  });
 
   const oaiTools = tools;
 
@@ -30,6 +32,7 @@ export async function runWithOpenAILLM(
     messages: baseMsgs,
     tools: oaiTools,
     tool_choice: "auto",
+    max_tokens: 4096,
   });
 
   const choice = first.choices[0];

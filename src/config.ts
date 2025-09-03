@@ -38,9 +38,12 @@ export const config = {
   llmProvider: (process.env.LLM_PROVIDER ?? "anthropic") as
     | "anthropic"
     | "openai"
+    | "openrouter"
     | "mock",
 
   anthropicKey: process.env.ANTHROPIC_API_KEY,
   openaiKey: process.env.OPENAI_API_KEY,
+  openRouterKey: process.env.OPENROUTER_API_KEY,
   openaiModel: process.env.OPENAI_MODEL ?? "gpt-4.1", // pick default
+  openRouterModel: process.env.OPENROUTER_MODEL ?? "gpt-4.1", // pick default
 };

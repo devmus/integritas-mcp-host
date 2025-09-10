@@ -4,22 +4,22 @@ import express from "express";
 import { httpLogger, log } from "./logger.js";
 import { chatHandler } from "./routes/chat.js";
 import { config } from "./config.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import cors from "cors";
 
-// ...
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+
 const app = express();
 
-// configure cors
-// Define your frontend's origin
-const allowedOrigins = ["http://localhost:3000"];
-
-const options = {
-  origin: allowedOrigins,
-};
-// Use the CORS middleware
-app.use(cors(options));
+// CORS
+const allowedOrigins = (process.env.CORS_ORIGINS ?? "http://localhost:3000",
+"http://localhost:3001",
+"http://localhost:3002")
+  .split(",")
+  .map((s) => s.trim());
+app.use(cors({ origin: allowedOrigins }));
 
 app.use(express.json({ limit: "1mb" }));
 app.use(httpLogger);
@@ -27,23 +27,40 @@ app.use(httpLogger);
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 app.post("/chat", chatHandler);
 
-// make env a Record<string,string>
+// STDIO env (if needed)
 const env = Object.fromEntries(
   Object.entries(process.env).filter(([, v]) => v !== undefined)
 ) as Record<string, string>;
 
-const transport = new StdioClientTransport({
-  command:
-    "D:\\Programmering\\Minima\\Projects\\integritas-mcp-server\\.venv\\Scripts\\python.exe",
-  args: ["-m", "integritas_mcp_server", "--stdio"], // <-- flag, not subcommand
-  cwd: "D:\\Programmering\\Minima\\Projects\\integritas-mcp-server",
-  env,
-});
+let transport:
+  | StdioClientTransport
+  | SSEClientTransport
+  | StreamableHTTPClientTransport;
+
+if (config.mcpMode === "http") {
+  if (!config.mcpHttpUrl)
+    throw new Error("MCP_HTTP_URL is required when MCP_MODE=http");
+  transport = new StreamableHTTPClientTransport(new URL(config.mcpHttpUrl));
+} else if (config.mcpMode === "sse") {
+  if (!config.mcpSseUrl)
+    throw new Error("MCP_SSE_URL is required when MCP_MODE=sse");
+  transport = new SSEClientTransport(new URL(config.mcpSseUrl));
+} else {
+  // STDIO
+  transport = new StdioClientTransport({
+    command: config.mcpStdioCmd,
+    args: config.mcpStdioArgs.length
+      ? config.mcpStdioArgs
+      : ["-m", "integritas_mcp_server", "--stdio"],
+    cwd: "D:\\Programmering\\Minima\\Projects\\integritas-mcp-server",
+    env,
+  });
+}
 
 const mcpClient = new Client({
   name: "integritas-mcp-host",
   version: "0.1.0",
-  requestTimeoutMs: 120_000, // give us breathing room while debugging
+  requestTimeoutMs: 120_000,
 });
 
 await mcpClient.connect(transport);
@@ -72,6 +89,16 @@ app.get("/_tool/health", async (_req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
+
+// graceful shutdown
+const close = async () => {
+  try {
+    await mcpClient.close();
+  } catch {}
+  process.exit(0);
+};
+process.on("SIGINT", close);
+process.on("SIGTERM", close);
 
 app.listen(config.port, () => {
   log.info(

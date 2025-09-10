@@ -37,6 +37,8 @@ let transport:
   | SSEClientTransport
   | StreamableHTTPClientTransport;
 
+const mcpCwd = process.env.MCP_PY_CWD || "/home/integritas-mcp-server";
+
 if (config.mcpMode === "http") {
   if (!config.mcpHttpUrl)
     throw new Error("MCP_HTTP_URL is required when MCP_MODE=http");
@@ -52,7 +54,7 @@ if (config.mcpMode === "http") {
     args: config.mcpStdioArgs.length
       ? config.mcpStdioArgs
       : ["-m", "integritas_mcp_server", "--stdio"],
-    cwd: "D:\\Programmering\\Minima\\Projects\\integritas-mcp-server",
+    cwd: mcpCwd,
     env,
   });
 }

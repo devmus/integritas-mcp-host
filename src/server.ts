@@ -15,6 +15,7 @@ const app = express();
 
 // CORS
 const allowedOrigins = (process.env.CORS_ORIGINS ?? "http://localhost:3000",
+"https://integritas.minima.global/mcp",
 "http://localhost:3001",
 "http://localhost:3011",
 "http://localhost:3002")

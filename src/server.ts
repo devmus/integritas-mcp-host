@@ -1,10 +1,12 @@
 // src\server.ts
 
 import express from "express";
-import { httpLogger, log } from "./logger.js";
+import cors from "cors";
+import "dotenv/config";
+import { httpLogger, log } from "./logger/logger.js";
+import { captureResponseBody } from "./middleware/captureResponseBody.js";
 import { chatHandler } from "./routes/chat.js";
 import { config } from "./config.js";
-import cors from "cors";
 
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -14,16 +16,30 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 const app = express();
 
 // CORS
-const allowedOrigins = (process.env.CORS_ORIGINS ?? "http://localhost:3000",
-"https://integritas.minima.global/mcp",
-"http://localhost:3001",
-"http://localhost:3011",
-"http://localhost:3002")
-  .split(",")
-  .map((s) => s.trim());
+const allowedOrigins = config.allowedCors.split(",").map((s) => s.trim());
 app.use(cors({ origin: allowedOrigins }));
 
-app.use(express.json({ limit: "1mb" }));
+// Replace your JSON parser line with this:
+app.use(
+  express.json({
+    limit: "10mb",
+    verify: (req, _res, buf) => {
+      // keep a small sample for logs; do NOT mutate the stream
+      const max = 4096;
+      (req as any).raw = {
+        bodySample:
+          buf.length > max
+            ? buf.subarray(0, max).toString("utf8") + "…"
+            : buf.toString("utf8"),
+      };
+    },
+  })
+);
+
+// ---- Response body capture must be BEFORE httpLogger ----
+app.use(captureResponseBody(4096));
+
+// Pino HTTP logging
 app.use(httpLogger);
 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
@@ -39,7 +55,7 @@ let transport:
   | SSEClientTransport
   | StreamableHTTPClientTransport;
 
-const mcpCwd = process.env.MCP_PY_CWD || "/home/integritas-mcp-server";
+const mcpCwd = config.mcpCwd;
 
 if (config.mcpMode === "http") {
   if (!config.mcpHttpUrl)
@@ -64,7 +80,7 @@ if (config.mcpMode === "http") {
 const mcpClient = new Client({
   name: "integritas-mcp-host",
   version: "0.1.0",
-  requestTimeoutMs: 120_000,
+  requestTimeoutMs: 240_000,
 });
 
 await mcpClient.connect(transport);

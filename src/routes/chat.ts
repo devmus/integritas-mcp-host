@@ -3,7 +3,7 @@ import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { pluckIdsFromContent } from "../mcp/toolMap.js";
 import { config } from "../config.js";
-import { log } from "../logger.js";
+import { log } from "../logger/logger.js";
 import type { ChatRequestBody, ToolStep } from "../types.js";
 
 import { composeSystemPrompt } from "../prompt/composer.js";
@@ -13,6 +13,78 @@ import { OpenAIAdapter } from "../llm/providers/openai.js";
 import { OpenRouterAdapter } from "../llm/providers/openrouter.js";
 import { MockAdapter } from "../llm/providers/mock.js";
 import { ensureObjectSchema, stripApiKeyEverywhere } from "../llm/toolUtils.js";
+
+// Tools are disabled for docs answers; satisfy the RunOptions type.
+const NOOP_CALL_TOOL = async (
+  _name: string,
+  _args?: Record<string, unknown>
+) => {
+  throw new Error("Tool calls are disabled for this turn.");
+};
+
+// --- helpers for logging ---
+const clamp = (s: unknown, n = 800) => {
+  try {
+    const str = typeof s === "string" ? s : JSON.stringify(s);
+    return str.length > n ? str.slice(0, n) + "…" : str;
+  } catch {
+    return String(s).slice(0, n) + "…";
+  }
+};
+
+function isDocsQuestion(text: string) {
+  return /what can you do|how.*(work|works)|integritas|capab|tools|help|docs|faq|schema|feature|price|pricing/i.test(
+    text || ""
+  );
+}
+
+type MCPResourceMeta = {
+  uri: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+};
+
+function pickRelevantResources(
+  userText: string,
+  all: MCPResourceMeta[],
+  limit = 4
+): string[] {
+  const q = (userText || "").toLowerCase();
+  const scored = all.map((r) => {
+    const hay = `${r.uri} ${r.name ?? ""} ${r.description ?? ""}`.toLowerCase();
+    let score = 0;
+    for (const w of q.split(/\s+/)) if (w && hay.includes(w)) score += 1;
+    // prefer your docs by default
+    if (r.uri.startsWith("integritas://docs/")) score += 2;
+    return { uri: r.uri, score };
+  });
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((s) => s.uri);
+}
+
+async function readResourceText(mcpClient: any, uri: string): Promise<string> {
+  const out = await mcpClient.readResource({ uri });
+  const first = out?.contents?.[0];
+  if (!first) return "";
+  if ("text" in first && typeof first.text === "string") return first.text;
+  return ""; // ignore binary for this path
+}
+
+const summarizeToolResult = (out: any) => {
+  // mcpClient.callTool returns { content, isError?, ... } or similar
+  // Try to pick structured bits if present
+  const sc =
+    out?.structuredContent ?? out?.result?.structuredContent ?? undefined;
+  const summary =
+    sc?.summary ?? out?.summary ?? out?.message ?? out?.error ?? undefined;
+
+  // keep small sample of raw for forensics
+  const raw = clamp(out, 600);
+  return { summary, raw };
+};
 
 function deepMerge<T>(base: T, extra: Partial<T>): T {
   if (base && extra && typeof base === "object" && typeof extra === "object") {
@@ -65,7 +137,6 @@ async function toolsFromMCP(mcpClient: any): Promise<ToolCatalogItem[]> {
   });
 }
 
-/** Scope tools to the user's last message; never expose diagnostics */
 function scopeTools(
   userText: string,
   all: ToolCatalogItem[]
@@ -77,33 +148,24 @@ function scopeTools(
 
   const picks: ToolCatalogItem[] = [];
 
-  // if (/\bstamp|\btimestamp|\banchor\b/.test(lower) && byName["stamp_hash"]) {
-  //   picks.push(byName["stamp_hash"]);
-  // }
-  // if (/\bvalidate|\bverify\b/.test(lower) && byName["validate_hash"]) {
-  //   picks.push(byName["validate_hash"]);
-  // }
-  // if (/\bstatus|\btx\b|\buid\b/.test(lower) && byName["get_stamp_status"]) {
-  //   picks.push(byName["get_stamp_status"]);
-  // }
-  // if (/\bproof|\bresolve\b/.test(lower) && byName["resolve_proof"]) {
-  //   picks.push(byName["resolve_proof"]);
-  // }
-
-  // Heuristics for file-based stamping
+  // file/data OR upload (as before)
   if (/\bstamp\b.*\b(file|data)\b/.test(lower) && byName["stamp_data"])
     picks.push(byName["stamp_data"]);
   if (/\bupload\b/.test(lower) && byName["stamp_data"])
     picks.push(byName["stamp_data"]);
 
-  // Fallback: if nothing matched, allow validate + stamp
-  // if (!picks.length) {
-  //   if (byName["validate_hash"]) picks.push(byName["validate_hash"]);
-  //   if (byName["stamp_hash"]) picks.push(byName["stamp_hash"]);
-  // }
+  // NEW: "stamp … hash" or just "hash" intent
+  if (
+    (/\bstamp\b.*\bhash\b/.test(lower) || /\bhash\b/.test(lower)) &&
+    byName["stamp_data"]
+  ) {
+    picks.push(byName["stamp_data"]);
+  }
 
   // Never include diagnostic tools
-  return picks.filter((t) => !DIAGNOSTIC_TOOLS.has(t.name));
+  return picks.filter(
+    (t, i, arr) => !DIAGNOSTIC_TOOLS.has(t.name) && arr.indexOf(t) === i
+  );
 }
 
 /** Safe JSON parse */
@@ -145,8 +207,51 @@ export async function chatHandler(req: Request, res: Response) {
   const userText = body.messages.at(-1)?.content ?? "";
   const toolsInScope = scopeTools(userText, allTools);
 
+  // right after const toolsInScope = scopeTools(userText, allTools);
+  log.info(
+    {
+      event: "host_checkpoint",
+      requestId: rid,
+      inScope: toolsInScope.map((t) => t.name),
+    },
+    "host reached tool scoping"
+  );
+
+  // NEW: log what the LLM is allowed to call this turn
+  log.debug(
+    {
+      event: "tools_in_scope",
+      requestId: rid,
+      names: toolsInScope.map((t) => t.name),
+    },
+    "tools scoped for turn"
+  );
+
+  // NEW: collect per-call traces
+  const toolTrace: Array<{
+    name: string;
+    ms: number;
+    args: any;
+    ok: boolean;
+    result?: any;
+    error?: string;
+  }> = [];
+
   // Tool executor with API-key injection for stamping tools
   const toolArgs = body.toolArgs || {};
+  if (
+    toolArgs.stamp_data?.req &&
+    !toolsInScope.find((t) => t.name === "stamp_data")
+  ) {
+    const extra = allTools.find((t) => t.name === "stamp_data");
+    if (extra) toolsInScope.push(extra);
+    log.debug({
+      event: "tools_in_scope_forced",
+      requestId: rid,
+      reason: "toolArgs present",
+      name: "stamp_data",
+    });
+  }
 
   const callTool = async (name: string, args?: Record<string, unknown>) => {
     let merged: any = args ?? {};
@@ -160,24 +265,58 @@ export async function chatHandler(req: Request, res: Response) {
       if (merged.req.api_key == null) merged.req.api_key = apiKey;
     }
 
-    // log the exact payload we send to MCP (with secrets redacted)
-    log.info(
-      {
-        event: "tool_args",
-        tool: name,
-        sending: {
-          ...merged,
-          req: {
-            ...merged.req,
-            api_key: "<redacted>",
-            file_url: merged.req.file_url ? "<provided>" : undefined,
-          },
-        },
+    // prepare a safely redacted view of what we're sending
+    const safeArgs = {
+      ...merged,
+      req: {
+        ...merged.req,
+        api_key: merged.req.api_key ? "<redacted>" : undefined,
+        file_url: merged.req.file_url ? "<provided>" : undefined,
       },
+    };
+
+    log.info(
+      { event: "tool_args", tool: name, sending: safeArgs },
       "calling tool"
     );
 
-    return await mcpClient.callTool({ name, arguments: merged });
+    const t0 = Date.now();
+    try {
+      const out = await mcpClient.callTool({ name, arguments: merged });
+      const ms = Date.now() - t0;
+
+      const summary = summarizeToolResult(out);
+      toolTrace.push({
+        name,
+        ms,
+        args: safeArgs,
+        ok: true,
+        result: summary,
+      });
+
+      log.info(
+        {
+          event: "tool_result",
+          tool: name,
+          ms,
+          summary: summary.summary,
+          sample: summary.raw,
+        },
+        "tool completed"
+      );
+
+      return out;
+    } catch (e: any) {
+      const ms = Date.now() - t0;
+      const errMsg = String(e?.message || e);
+      toolTrace.push({ name, ms, args: safeArgs, ok: false, error: errMsg });
+
+      log.error(
+        { event: "tool_error", tool: name, ms, error: errMsg },
+        "tool failed"
+      );
+      throw e;
+    }
   };
 
   // Pick adapter
@@ -213,6 +352,66 @@ export async function chatHandler(req: Request, res: Response) {
       .json({ error: `Unknown LLM_PROVIDER: ${config.llmProvider}` });
   }
 
+  // ⬇️ INSERT THIS BLOCK *HERE* — before systemPrompt / wantStamp / model.run
+  if (isDocsQuestion(userText)) {
+    // 1) discover resources
+    const listed = (await mcpClient.listResources())?.resources ?? [];
+    const allRes: MCPResourceMeta[] = listed.map((r: any) => ({
+      uri: r.uri as string,
+      name: r.name as string | undefined,
+      description: r.description as string | undefined,
+      mimeType: r.mimeType as string | undefined,
+    }));
+
+    // 2) pick relevant + force include overview/tools if present
+    const forced = new Set<string>(
+      allRes
+        .filter(
+          (r) =>
+            r.uri === "integritas://docs/overview" ||
+            r.uri === "integritas://docs/tools"
+        )
+        .map((r) => r.uri)
+    );
+
+    const picks = pickRelevantResources(userText, allRes, 4);
+    const uris = Array.from(new Set<string>([...Array.from(forced), ...picks]));
+
+    // 3) read them
+    const texts = await Promise.all(
+      uris.map((u) => readResourceText(mcpClient, u))
+    );
+    const contextBlob = uris
+      .map((u, i) => `### ${u}\n${texts[i] || "(empty)"}`)
+      .join("\n\n");
+
+    // 4) answer with resources only (no tools) — no template backticks to avoid parse issues
+    const docsSystemPrompt = [
+      "You are answering questions about this MCP server's capabilities and the Integritas product.",
+      "Use ONLY the MCP resources provided below as ground truth. Do not call or suggest tools.",
+      "Cite the specific resource URI inline like: [source: integritas://docs/overview].",
+      "Resources:",
+      contextBlob,
+    ].join("\n");
+
+    const docsResult = await adapter.run(body.messages, {
+      model: undefined,
+      tools: [] as ToolCatalogItem[], // <- correctly typed empty list
+      systemPrompt: docsSystemPrompt,
+      maxToolRounds: 0,
+      callTool: NOOP_CALL_TOOL, // <- required by RunOptions
+      responseAsJson: false,
+    });
+
+    return res.json({
+      requestId: rid,
+      userId,
+      finalText: docsResult.text ?? "Here’s what I found.",
+      sources: uris,
+      tool_steps: [],
+    });
+  } // === End docs/resources branch ===
+
   // Compose a strict system prompt (JSON contract + ignore diagnostics)
   const systemPrompt = composeSystemPrompt(`Be precise, neutral, and terse.`, {
     userGoal: userText.slice(0, 240),
@@ -226,6 +425,29 @@ export async function chatHandler(req: Request, res: Response) {
       `Normalize hashes to lowercase hex.`,
     ],
   });
+
+  // Fallback: if we *know* what to do, just do it.
+  const wantStamp =
+    toolsInScope.some((t) => t.name === "stamp_data") &&
+    (body.toolArgs?.stamp_data?.req ||
+      /\bstamp\b.*\b(hash|file|data)\b/i.test(userText) ||
+      /\b[a-f0-9]{64}\b/i.test(userText)); // naive sha256
+
+  if (wantStamp) {
+    // Prefer client-provided args; otherwise try to extract a bare hash
+    let args = body.toolArgs?.stamp_data ?? { req: {} as any };
+    if (!args.req.file_hash) {
+      const m = userText.match(/\b[a-f0-9]{64}\b/i);
+      if (m) args = { req: { ...args.req, file_hash: m[0].toLowerCase() } };
+    }
+    const out = await callTool("stamp_data", args);
+    return res.json({
+      requestId: rid,
+      userId,
+      finalText: "Stamped (host fallback).",
+      tool_steps: [{ name: "stamp_data", result: out }],
+    });
+  }
 
   // Run model
   const result = await adapter.run(body.messages, {
@@ -242,6 +464,25 @@ export async function chatHandler(req: Request, res: Response) {
     const ids = pluckIdsFromContent(s.result);
     if (ids.tx_id || ids.uid) Object.assign(s, ids);
   }
+
+  // NEW: compact step log
+  const compactSteps = result.steps.map((s) => ({
+    name: s.name,
+    ok: !(s as any).isError,
+    uid: (s as any).uid,
+    tx_id: (s as any).tx_id,
+    // try to pull a tiny summary
+    summary:
+      (s.result as any)?.structuredContent?.summary ??
+      (s.result as any)?.summary ??
+      undefined,
+    sample: clamp(s.result, 400),
+  }));
+
+  log.debug(
+    { event: "tool_trace", requestId: rid, trace: toolTrace },
+    "per-call tool trace"
+  );
 
   // Host-side final rendering: use ONLY the last PRIMARY tool step
   const lastPrimary = [...result.steps]
@@ -293,7 +534,7 @@ export async function chatHandler(req: Request, res: Response) {
   }
 
   log.info(
-    { event: "chat_complete", userId, requestId: rid, steps: result.steps },
+    { event: "chat_complete", userId, requestId: rid, steps: compactSteps },
     "chat complete"
   );
 

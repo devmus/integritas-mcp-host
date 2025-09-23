@@ -47,10 +47,11 @@ export function createToolCaller(
       },
     };
 
-    log.info(
-      { event: "tool_args", tool: name, sending: safeArgs },
-      "calling tool"
-    );
+    // log.info(
+    //   { event: "tool_args", tool: name, sending: safeArgs },
+    //   "calling tool"
+    // );
+    console.log("Tool caller starting...");
 
     const t0 = Date.now();
     try {
@@ -59,25 +60,58 @@ export function createToolCaller(
       const summary = summarizeToolResult(out);
       trace.push({ name, ms, args: safeArgs, ok: true, result: summary });
 
-      log.info(
-        {
-          event: "tool_result",
-          tool: name,
-          ms,
-          summary: summary.summary,
-          sample: summary.raw,
-        },
-        "tool completed"
-      );
+      // log.info(
+      //   {
+      //     event: "tool_result",
+      //     tool: name,
+      //     ms,
+      //     summary: summary.summary,
+      //     sample: summary.raw,
+      //   },
+      //   "tool completed"
+      // );
+      console.log("Tool caller completed");
       return out;
     } catch (e: any) {
       const ms = Date.now() - t0;
       const errMsg = String(e?.message || e);
+      const code = e?.code ?? e?.data?.code;
+      const timeoutMs: number | undefined = e?.data?.timeout;
+
+      // >>> Special-case: MCP SDK timeout (-32001)
+      if (code === -32001 || /request timed out/i.test(errMsg)) {
+        const friendly = {
+          isError: true,
+          // give the UI a consistent place to read from
+          structuredContent: {
+            summary: `The "${name}" tool timed out after ${Math.round(
+              (timeoutMs ?? 60000) / 1000
+            )}s.`,
+          },
+          summary: `The "${name}" tool timed out after ${Math.round(
+            (timeoutMs ?? 60000) / 1000
+          )}s.`,
+          error: { code: -32001, timeout_ms: timeoutMs ?? 60000 },
+        };
+
+        const summary = summarizeToolResult(friendly);
+        trace.push({
+          name,
+          ms,
+          args: safeArgs,
+          ok: false,
+          result: summary,
+          error: errMsg,
+        });
+        console.log("Tool caller timeout");
+
+        // Return (not throw) so caller can display it
+        return friendly;
+      }
+
+      // Other tool errors: keep current behavior (bubble up)
       trace.push({ name, ms, args: safeArgs, ok: false, error: errMsg });
-      log.error(
-        { event: "tool_error", tool: name, ms, error: errMsg },
-        "tool failed"
-      );
+      console.log("Tool caller error");
       throw e;
     }
   };

@@ -26,3 +26,7 @@ To use OpenAI, you need to set the `OPENAI_API_KEY` and `OPENAI_MODEL` environme
 #### OpenRouter
 
 To use OpenRouter, you need to set the `OPENROUTER_API_KEY` and `OPENAI_MODEL` environment variables.
+
+## Debugging
+
+For easier debugging, the logging in `src/chat/toolCaller.ts` has been changed from `pino` to `console.log`.

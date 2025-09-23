@@ -167,10 +167,15 @@ export async function chatHandler(req: Request, res: Response) {
       if (m) args = { req: { ...args.req, file_hash: m[0].toLowerCase() } };
     }
     const out = await callTool("stamp_data", args);
+    const text =
+      (out as any)?.structuredContent?.summary ??
+      (out as any)?.summary ??
+      ((out as any)?.isError ? "Stamp failed." : "Stamp complete.");
+
     return res.json({
       requestId: rid,
       userId,
-      finalText: "Stamped (host fallback).",
+      finalText: text,
       tool_steps: [{ name: "stamp_data", result: out }],
     });
   }
@@ -179,10 +184,17 @@ export async function chatHandler(req: Request, res: Response) {
 
   if (body.toolArgs?.verify_data?.req) {
     const out = await callTool("verify_data", body.toolArgs.verify_data);
+    const text =
+      (out as any)?.structuredContent?.summary ??
+      (out as any)?.summary ??
+      ((out as any)?.isError
+        ? "Verification failed."
+        : "Verification complete.");
+
     return res.json({
       requestId: rid,
       userId,
-      finalText: "Verification completed (host fallback).",
+      finalText: text,
       tool_steps: [{ name: "verify_data", result: out }],
     });
   }

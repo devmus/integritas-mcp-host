@@ -21,6 +21,7 @@ import { createToolCaller } from "../chat/toolCaller.js";
 import { chooseAdapter } from "../llm/chooseAdapter.js";
 import { clamp, tryParseJSON } from "../chat/utils.js";
 import { finalizeText } from "../chat/render.js";
+import { classifyLLMError } from "../chat/classifyLLMError.js";
 
 type MCPResourceMeta = {
   uri: string;
@@ -99,24 +100,46 @@ export async function chatHandler(req: Request, res: Response) {
     ].join("\n");
 
     const adapter = chooseAdapter();
-    const docsResult = await adapter.run(body.messages, {
-      model: undefined,
-      tools: [] as ToolCatalogItem[],
-      systemPrompt: docsSystemPrompt,
-      maxToolRounds: 0,
-      callTool: async () => {
-        throw new Error("Tool calls are disabled for this turn.");
-      },
-      responseAsJson: false,
-    });
+    try {
+      const docsResult = await adapter.run(body.messages, {
+        model: undefined,
+        tools: [] as ToolCatalogItem[],
+        systemPrompt: docsSystemPrompt,
+        maxToolRounds: 0,
+        callTool: async () => {
+          throw new Error("Tool calls are disabled for this turn.");
+        },
+        responseAsJson: false,
+      });
 
-    return res.json({
-      requestId: rid,
-      userId,
-      finalText: docsResult.text ?? "Here’s what I found.",
-      sources: uris,
-      tool_steps: [],
-    });
+      return res.json({
+        requestId: rid,
+        userId,
+        finalText: docsResult.text ?? "Here’s what I found.",
+        sources: uris,
+        tool_steps: [],
+      });
+    } catch (err: any) {
+      const info = classifyLLMError(err);
+      if (info.isLLMTransport) {
+        const note = info.isRateLimit
+          ? `Model is rate limited${
+              info.retryAfter ? ` (retry after ~${info.retryAfter}s)` : ""
+            }.`
+          : `Model backend is unavailable${
+              info.status ? ` (HTTP ${info.status})` : ""
+            }.`;
+        return res.json({
+          requestId: rid,
+          userId,
+          finalText: `${note} Please try again shortly.`,
+          sources: uris,
+          tool_steps: [],
+        });
+      }
+      // Not an LLM transport error → let your normal error handling take it
+      throw err;
+    }
   } else {
     console.log("Is chat question?", false);
   }
@@ -211,62 +234,78 @@ export async function chatHandler(req: Request, res: Response) {
     ],
   });
 
-  // try {
-  const result = await adapter.run(body.messages, {
-    model: undefined,
-    tools: toolsInScope,
-    systemPrompt,
-    maxToolRounds: 3,
-    callTool,
-    responseAsJson: true,
-  });
+  try {
+    const result = await adapter.run(body.messages, {
+      model: undefined,
+      tools: toolsInScope,
+      systemPrompt,
+      maxToolRounds: 3,
+      callTool,
+      responseAsJson: true,
+    });
 
-  console.log("Result:", result);
+    console.log("Result:", result);
 
-  // Decorate steps a bit for UI + logs
-  for (const s of result.steps) {
-    const ids = pluckIdsFromContent(s.result);
-    if (ids.tx_id || ids.uid) Object.assign(s, ids);
+    // Decorate steps a bit for UI + logs
+    for (const s of result.steps) {
+      const ids = pluckIdsFromContent(s.result);
+      if (ids.tx_id || ids.uid) Object.assign(s, ids);
+    }
+
+    const compactSteps = result.steps.map((s) => ({
+      name: s.name,
+      ok: !(s as any).isError,
+      uid: (s as any).uid,
+      tx_id: (s as any).tx_id,
+      summary:
+        (s.result as any)?.structuredContent?.summary ??
+        (s.result as any)?.summary ??
+        undefined,
+      sample: clamp(s.result, 400),
+    }));
+
+    log.debug(
+      { event: "tool_trace", requestId: rid, trace },
+      "per-call tool trace"
+    );
+
+    // Final text (prefer model JSON; else last primary step)
+    const finalText = finalizeText(result, result.steps);
+
+    log.info(
+      { event: "chat_complete", userId, requestId: rid, steps: compactSteps },
+      "chat complete"
+    );
+
+    return res.json({
+      requestId: rid,
+      userId,
+      finalText,
+      tool_steps: result.steps,
+    });
+  } catch (err: any) {
+    const info = classifyLLMError(err);
+
+    if (info.isLLMTransport) {
+      const note = info.isRateLimit
+        ? `Model is rate limited${
+            info.retryAfter ? ` (retry after ~${info.retryAfter}s)` : ""
+          }.`
+        : `Model backend is unavailable${
+            info.status ? ` (HTTP ${info.status})` : ""
+          }.`;
+
+      // IMPORTANT: still return 200 with a friendly assistant message
+      // so your UI shows something useful and doesn’t break.
+      return res.json({
+        requestId: rid,
+        userId,
+        finalText: `${note} Please try again shortly.`,
+        tool_steps: [],
+      });
+    }
+
+    // Not an LLM transport error -> propagate (likely an MCP/tool path issue you want to surface)
+    throw err;
   }
-
-  const compactSteps = result.steps.map((s) => ({
-    name: s.name,
-    ok: !(s as any).isError,
-    uid: (s as any).uid,
-    tx_id: (s as any).tx_id,
-    summary:
-      (s.result as any)?.structuredContent?.summary ??
-      (s.result as any)?.summary ??
-      undefined,
-    sample: clamp(s.result, 400),
-  }));
-
-  log.debug(
-    { event: "tool_trace", requestId: rid, trace },
-    "per-call tool trace"
-  );
-
-  // Final text (prefer model JSON; else last primary step)
-  const finalText = finalizeText(result, result.steps);
-
-  log.info(
-    { event: "chat_complete", userId, requestId: rid, steps: compactSteps },
-    "chat complete"
-  );
-
-  return res.json({
-    requestId: rid,
-    userId,
-    finalText,
-    tool_steps: result.steps,
-  });
-  // } catch (error) {
-  //   console.log("ERROR With LLM");
-  //   return res.json({
-  //     requestId: rid,
-  //     userId,
-  //     finalText: "ERROR With LLM",
-  //     tool_steps: "Error",
-  //   });
-  // }
 }

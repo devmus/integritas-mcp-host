@@ -30,6 +30,12 @@ type MCPResourceMeta = {
 };
 
 export async function chatHandler(req: Request, res: Response) {
+  log.info(
+    {
+      event: "host_checkpoint",
+    },
+    "chatHandler started"
+  );
   const rid = (req.headers["x-request-id"] as string) || uuid();
   const userId =
     (req.headers["x-user-id"] as string) ||

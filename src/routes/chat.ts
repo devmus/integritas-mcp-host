@@ -30,18 +30,18 @@ type MCPResourceMeta = {
 };
 
 export async function chatHandler(req: Request, res: Response) {
-  log.info(
-    {
-      event: "host_checkpoint",
-    },
-    "chatHandler started"
-  );
+  console.log("------------- CHAT Handler Starting New -------------");
+  console.log(Date.now());
+
   const rid = (req.headers["x-request-id"] as string) || uuid();
   const userId =
     (req.headers["x-user-id"] as string) ||
     (req.body?.userId as string) ||
     "anon";
   const body = req.body as ChatRequestBody;
+
+  //User prompt contains conversation hisotry
+  console.log("User conversation:", body);
   if (!body?.messages?.length)
     return res.status(400).json({ error: "messages[] required" });
 
@@ -58,28 +58,15 @@ export async function chatHandler(req: Request, res: Response) {
 
   // Discover tools + scope
   const allTools = await toolsFromMCP(mcpClient);
+  // console.log("Tools from MCP server", allTools);
   const userText = body.messages.at(-1)?.content ?? "";
+  // console.log("User latest prompt:", userText);
   const toolsInScope = scopeTools(userText, allTools);
-
-  log.info(
-    {
-      event: "host_checkpoint",
-      requestId: rid,
-      inScope: toolsInScope.map((t) => t.name),
-    },
-    "host reached tool scoping"
-  );
-  log.debug(
-    {
-      event: "tools_in_scope",
-      requestId: rid,
-      names: toolsInScope.map((t) => t.name),
-    },
-    "tools scoped for turn"
-  );
+  console.log("toolsInScope", toolsInScope);
 
   // Docs-only branch (no tools)
   if (isDocsQuestion(userText)) {
+    console.log("Is chat question?", true);
     const listed = (await mcpClient.listResources())?.resources ?? [];
     const allRes: MCPResourceMeta[] = listed.map((r: any) => ({
       uri: String(r.uri),
@@ -130,7 +117,11 @@ export async function chatHandler(req: Request, res: Response) {
       sources: uris,
       tool_steps: [],
     });
+  } else {
+    console.log("Is chat question?", false);
   }
+
+  console.log("Call for tool!");
 
   // Prepare tool caller (with API-key injection + tracing)
   const { callTool, trace } = createToolCaller(
@@ -163,16 +154,13 @@ export async function chatHandler(req: Request, res: Response) {
 
   // Host fallback: verify directly if obvious
 
-  if (body.toolArgs?.verify_data_with_proof?.req) {
-    const out = await callTool(
-      "verify_data_with_proof",
-      body.toolArgs.verify_data_with_proof
-    );
+  if (body.toolArgs?.verify_data?.req) {
+    const out = await callTool("verify_data", body.toolArgs.verify_data);
     return res.json({
       requestId: rid,
       userId,
       finalText: "Verification completed (host fallback).",
-      tool_steps: [{ name: "verify_data_with_proof", result: out }],
+      tool_steps: [{ name: "verify_data", result: out }],
     });
   }
 
@@ -223,6 +211,7 @@ export async function chatHandler(req: Request, res: Response) {
     ],
   });
 
+  // try {
   const result = await adapter.run(body.messages, {
     model: undefined,
     tools: toolsInScope,
@@ -231,6 +220,8 @@ export async function chatHandler(req: Request, res: Response) {
     callTool,
     responseAsJson: true,
   });
+
+  console.log("Result:", result);
 
   // Decorate steps a bit for UI + logs
   for (const s of result.steps) {
@@ -256,32 +247,6 @@ export async function chatHandler(req: Request, res: Response) {
   );
 
   // Final text (prefer model JSON; else last primary step)
-  // let finalText = result.text;
-  // const obj = tryParseJSON<any>(result.text || "");
-  // if (obj && typeof obj === "object") {
-  //   obj.chain = "Minima";
-  //   const lastPrimary = [...result.steps]
-  //     .reverse()
-  //     .find((s) => PRIMARY_TOOLS.has(s.name));
-  //   if (lastPrimary && (!obj.action || !PRIMARY_TOOLS.has(obj.action)))
-  //     obj.action = lastPrimary.name;
-  //   finalText = String(obj.user_message ?? finalText ?? "");
-  // } else {
-  //   const lastPrimary = [...result.steps]
-  //     .reverse()
-  //     .find((s) => PRIMARY_TOOLS.has(s.name));
-  //   if (lastPrimary) {
-  //     const sc = (lastPrimary.result as any)?.structuredContent || {};
-  //     finalText =
-  //       lastPrimary.name === "stamp_hash"
-  //         ? `Hash stamped on Minima. uid=${sc.uid ?? "not provided"}, tx_id=${
-  //             sc.tx_id ?? "not provided"
-  //           }, stamped_at=${sc.stamped_at ?? "not provided"}.`
-  //         : `Result on Minima: ${sc.summary ?? "completed"}.`;
-  //   }
-  // }
-
-  // Final text (prefer model JSON; else last primary step)
   const finalText = finalizeText(result, result.steps);
 
   log.info(
@@ -295,4 +260,13 @@ export async function chatHandler(req: Request, res: Response) {
     finalText,
     tool_steps: result.steps,
   });
+  // } catch (error) {
+  //   console.log("ERROR With LLM");
+  //   return res.json({
+  //     requestId: rid,
+  //     userId,
+  //     finalText: "ERROR With LLM",
+  //     tool_steps: "Error",
+  //   });
+  // }
 }

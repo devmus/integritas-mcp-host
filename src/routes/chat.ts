@@ -18,10 +18,11 @@ import {
   listResourcesAsText,
 } from "../chat/resources.js";
 import { createToolCaller } from "../chat/toolCaller.js";
-import { chooseAdapter } from "../llm/chooseAdapter.js";
+import { chooseAdapter, type LLMChoice } from "../llm/chooseAdapter.js";
 import { clamp, tryParseJSON } from "../chat/utils.js";
 import { finalizeText } from "../chat/render.js";
 import { classifyLLMError } from "../chat/classifyLLMError.js";
+import { z } from "zod";
 
 type MCPResourceMeta = {
   uri: string;
@@ -29,6 +30,26 @@ type MCPResourceMeta = {
   description?: string;
   mimeType?: string;
 };
+
+const LLMChoiceSchema = z
+  .object({
+    provider: z.enum(["anthropic", "openai", "openrouter", "mock"]).optional(),
+    model: z.string().min(1).optional(),
+  })
+  .optional();
+
+const ChatBodySchema = z.object({
+  messages: z
+    .array(
+      z.object({
+        role: z.enum(["user", "assistant", "system", "tool"]),
+        content: z.any(),
+        // include whatever else your message type needs
+      })
+    )
+    .min(1),
+  llm: LLMChoiceSchema, // <-- new
+});
 
 export async function chatHandler(req: Request, res: Response) {
   console.log("------------- CHAT Handler Starting New -------------");
@@ -40,6 +61,25 @@ export async function chatHandler(req: Request, res: Response) {
     (req.body?.userId as string) ||
     "anon";
   const body = req.body as ChatRequestBody;
+
+  //Pick LLM
+  const parse = ChatBodySchema.safeParse(req.body);
+  if (!parse.success) {
+    return res
+      .status(400)
+      .json({ error: "Invalid body", issues: parse.error.format() });
+  }
+  let adapter;
+  try {
+    const { llm } = parse.data;
+    adapter = chooseAdapter(llm as LLMChoice);
+  } catch (e: any) {
+    // Model not allowed, unknown provider, or missing key
+    return res.status(400).json({
+      error: "LLM_SELECTION_FAILED",
+      message: e?.message ?? "Invalid LLM selection",
+    });
+  }
 
   //User prompt contains conversation hisotry
   console.log("User conversation:", body);
@@ -99,7 +139,6 @@ export async function chatHandler(req: Request, res: Response) {
       contextBlob,
     ].join("\n");
 
-    const adapter = chooseAdapter();
     try {
       const docsResult = await adapter.run(body.messages, {
         model: undefined,
@@ -121,19 +160,22 @@ export async function chatHandler(req: Request, res: Response) {
       });
     } catch (err: any) {
       const info = classifyLLMError(err);
+
       if (info.isLLMTransport) {
-        const note = info.isRateLimit
-          ? `Model is rate limited${
-              info.retryAfter ? ` (retry after ~${info.retryAfter}s)` : ""
-            }.`
-          : `Model backend is unavailable${
-              info.status ? ` (HTTP ${info.status})` : ""
-            }.`;
+        const msg =
+          info.message ??
+          (info.isRateLimit
+            ? `Model is rate limited${
+                info.retryAfter ? ` (retry after ~${info.retryAfter}s)` : ""
+              }.`
+            : `Model backend is unavailable${
+                info.status ? ` (HTTP ${info.status})` : ""
+              }.`);
+
         return res.json({
           requestId: rid,
           userId,
-          finalText: `${note} Please try again shortly.`,
-          sources: uris,
+          finalText: msg,
           tool_steps: [],
         });
       }
@@ -172,10 +214,18 @@ export async function chatHandler(req: Request, res: Response) {
       (out as any)?.summary ??
       ((out as any)?.isError ? "Stamp failed." : "Stamp complete.");
 
+    const links =
+      out?.structuredContent?.links ??
+      // TEMP back-compat if old servers still send top-level URLs:
+      (out?.proof_url
+        ? [{ rel: "proof", href: out.proof_url, label: "Download proof" }]
+        : undefined);
+
     return res.json({
       requestId: rid,
       userId,
       finalText: text,
+      links,
       tool_steps: [{ name: "stamp_data", result: out }],
     });
   }
@@ -191,10 +241,23 @@ export async function chatHandler(req: Request, res: Response) {
         ? "Verification failed."
         : "Verification complete.");
 
+    const links =
+      out?.structuredContent?.links ??
+      (out?.verification_url
+        ? [
+            {
+              rel: "verification",
+              href: out.verification_url,
+              label: "View verification",
+            },
+          ]
+        : undefined);
+
     return res.json({
       requestId: rid,
       userId,
       finalText: text,
+      links,
       tool_steps: [{ name: "verify_data", result: out }],
     });
   }
@@ -231,8 +294,6 @@ export async function chatHandler(req: Request, res: Response) {
     });
   }
 
-  // Run model with scoped tools
-  const adapter = chooseAdapter();
   const systemPrompt = composeSystemPrompt(`Be precise, neutral, and terse.`, {
     userGoal: userText.slice(0, 240),
     toolsInScope,
@@ -247,6 +308,7 @@ export async function chatHandler(req: Request, res: Response) {
   });
 
   try {
+    // Run model with scoped tools
     const result = await adapter.run(body.messages, {
       model: undefined,
       tools: toolsInScope,
@@ -284,6 +346,11 @@ export async function chatHandler(req: Request, res: Response) {
     // Final text (prefer model JSON; else last primary step)
     const finalText = finalizeText(result, result.steps);
 
+    const links = result.steps
+      .flatMap((s) => (s.result as any)?.structuredContent?.links ?? [])
+      .filter(Boolean)
+      .slice(0, 5);
+
     log.info(
       { event: "chat_complete", userId, requestId: rid, steps: compactSteps },
       "chat complete"
@@ -293,26 +360,27 @@ export async function chatHandler(req: Request, res: Response) {
       requestId: rid,
       userId,
       finalText,
+      links,
       tool_steps: result.steps,
     });
   } catch (err: any) {
     const info = classifyLLMError(err);
 
     if (info.isLLMTransport) {
-      const note = info.isRateLimit
-        ? `Model is rate limited${
-            info.retryAfter ? ` (retry after ~${info.retryAfter}s)` : ""
-          }.`
-        : `Model backend is unavailable${
-            info.status ? ` (HTTP ${info.status})` : ""
-          }.`;
+      const msg =
+        info.message ??
+        (info.isRateLimit
+          ? `Model is rate limited${
+              info.retryAfter ? ` (retry after ~${info.retryAfter}s)` : ""
+            }.`
+          : `Model backend is unavailable${
+              info.status ? ` (HTTP ${info.status})` : ""
+            }.`);
 
-      // IMPORTANT: still return 200 with a friendly assistant message
-      // so your UI shows something useful and doesn’t break.
       return res.json({
         requestId: rid,
         userId,
-        finalText: `${note} Please try again shortly.`,
+        finalText: msg,
         tool_steps: [],
       });
     }

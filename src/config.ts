@@ -33,9 +33,13 @@ export const config = {
     | "openrouter"
     | "mock",
 
+  //LLM KEYS
   anthropicKey: process.env.ANTHROPIC_API_KEY,
   openaiKey: process.env.OPENAI_API_KEY,
   openRouterKey: process.env.OPENROUTER_API_KEY,
+  //DEFAULT MODELS
+  anthropicModel: process.env.OPENAI_MODEL ?? "claude-3-5-sonnet-20240620", // pick default
   openaiModel: process.env.OPENAI_MODEL ?? "gpt-4.1", // pick default
-  openRouterModel: process.env.OPENROUTER_MODEL ?? "gpt-4.1", // pick default
+  openRouterModel:
+    process.env.OPENROUTER_MODEL ?? "deepseek/deepseek-chat-v3.1:free", // pick default
 };

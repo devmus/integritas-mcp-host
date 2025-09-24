@@ -1,15 +1,10 @@
 import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
-import { pluckIdsFromContent } from "../mcp/toolMap.js";
 import { config } from "../config.js";
 import { log } from "../logger/logger.js";
-import type { ChatRequestBody } from "../types.js";
-
 import { composeSystemPrompt } from "../prompt/composer.js";
 import type { ToolCatalogItem } from "../llm/adapter.js";
-
 import { DIAGNOSTIC_TOOLS, PRIMARY_TOOLS } from "../chat/constants.js";
-
 import { toolsFromMCP } from "../chat/toolsFromMCP.js";
 import { scopeTools } from "../chat/scopeTools.js";
 import {
@@ -19,17 +14,52 @@ import {
 } from "../chat/resources.js";
 import { createToolCaller } from "../chat/toolCaller.js";
 import { chooseAdapter, type LLMChoice } from "../llm/chooseAdapter.js";
-import { clamp, tryParseJSON } from "../chat/utils.js";
-import { finalizeText } from "../chat/render.js";
 import { classifyLLMError } from "../chat/classifyLLMError.js";
 import { z } from "zod";
+import type { ChatMessage } from "../types.js";
 
-type MCPResourceMeta = {
-  uri: string;
-  name?: string;
-  description?: string;
-  mimeType?: string;
-};
+// helper to normalize/whitelist incoming messages
+function toChatMessages(raw: any[]): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (const m of raw ?? []) {
+    const role = m?.role;
+    if (role !== "user" && role !== "assistant" && role !== "system") continue; // drop "tool" etc.
+    const content =
+      typeof m?.content === "string" ? m.content : String(m?.content ?? "");
+    out.push({ role, content });
+  }
+  // ensure at least one user message (adapter safety)
+  if (out.length === 0) out.push({ role: "user", content: "Hello" });
+  return out;
+}
+
+/** Small link shape sent to the client for buttons */
+type ChatLink = { rel?: string; href: string; label?: string };
+
+/** Extract links[] from a tool result envelope */
+function extractLinksFromResult(result: any): ChatLink[] {
+  const links = result?.structuredContent?.links;
+  return Array.isArray(links)
+    ? links.filter((l) => l && typeof l.href === "string")
+    : [];
+}
+
+/** Compute final chat text: prefer free text, else last envelope summary */
+function finalizeTextFromSteps(result: any): string {
+  if (typeof result?.text === "string" && result.text.trim()) {
+    return result.text.trim();
+  }
+  const fromSteps =
+    [...(result?.steps ?? [])]
+      .reverse()
+      .map(
+        (s: any) => s?.result?.structuredContent?.summary ?? s?.result?.summary
+      )
+      .find((t: any) => typeof t === "string" && t.trim()) || "";
+  return fromSteps || "Done.";
+}
+
+/* --------------------------- Validation schema --------------------------- */
 
 const LLMChoiceSchema = z
   .object({
@@ -38,78 +68,70 @@ const LLMChoiceSchema = z
   })
   .optional();
 
-const ChatBodySchema = z.object({
-  messages: z
-    .array(
-      z.object({
-        role: z.enum(["user", "assistant", "system", "tool"]),
-        content: z.any(),
-        // include whatever else your message type needs
-      })
-    )
-    .min(1),
-  llm: LLMChoiceSchema, // <-- new
+const MessageSchema = z.object({
+  role: z.enum(["user", "assistant", "system", "tool"]),
+  content: z.string(), // was z.any()
 });
 
-export async function chatHandler(req: Request, res: Response) {
-  console.log("------------- CHAT Handler Starting New -------------");
-  console.log(Date.now());
+const ChatBodySchema = z.object({
+  messages: z.array(MessageSchema).min(1),
+  toolArgs: z.record(z.any()).optional(),
+  llm: LLMChoiceSchema,
+});
 
+/* -------------------------------- Handler -------------------------------- */
+
+export async function chatHandler(req: Request, res: Response) {
   const rid = (req.headers["x-request-id"] as string) || uuid();
   const userId =
     (req.headers["x-user-id"] as string) ||
     (req.body?.userId as string) ||
     "anon";
-  const body = req.body as ChatRequestBody;
 
-  //Pick LLM
-  const parse = ChatBodySchema.safeParse(req.body);
-  if (!parse.success) {
+  // Validate body
+  const parsed = ChatBodySchema.safeParse(req.body);
+  if (!parsed.success) {
     return res
       .status(400)
-      .json({ error: "Invalid body", issues: parse.error.format() });
+      .json({ error: "Invalid body", issues: parsed.error.format() });
   }
+  const body = parsed.data;
+
+  const chatMessages = toChatMessages(body.messages);
+
+  // Choose adapter from per-request llm (with allowlist + key checks)
   let adapter;
   try {
-    const { llm } = parse.data;
-    adapter = chooseAdapter(llm as LLMChoice);
+    adapter = chooseAdapter(body.llm as LLMChoice);
   } catch (e: any) {
-    // Model not allowed, unknown provider, or missing key
     return res.status(400).json({
       error: "LLM_SELECTION_FAILED",
       message: e?.message ?? "Invalid LLM selection",
     });
   }
 
-  //User prompt contains conversation hisotry
-  console.log("User conversation:", body);
-  if (!body?.messages?.length)
-    return res.status(400).json({ error: "messages[] required" });
-
-  // Optional per-request API key
+  // Per-request upstream API key (forwarded to MCP tools)
   const apiKey =
     (typeof (req.headers["x-api-key"] as string) === "string" &&
       (req.headers["x-api-key"] as string)) ||
-    (body as any).apiKey ||
+    (req.body as any).apiKey ||
     undefined;
 
   const mcpClient = req.app.locals.mcp as any;
-  if (!mcpClient)
+  if (!mcpClient) {
     return res.status(500).json({ error: "MCP client not initialized" });
+  }
 
-  // Discover tools + scope
+  // Discover tools and scope them to the user's last message
   const allTools = await toolsFromMCP(mcpClient);
-  // console.log("Tools from MCP server", allTools);
-  const userText = body.messages.at(-1)?.content ?? "";
-  // console.log("User latest prompt:", userText);
+  const userText = chatMessages.at(-1)?.content ?? "";
   const toolsInScope = scopeTools(userText, allTools);
-  console.log("toolsInScope", toolsInScope);
 
-  // Docs-only branch (no tools)
+  /* -------------------------- Docs-only fast path -------------------------- */
+
   if (isDocsQuestion(userText)) {
-    console.log("Is chat question?", true);
     const listed = (await mcpClient.listResources())?.resources ?? [];
-    const allRes: MCPResourceMeta[] = listed.map((r: any) => ({
+    const allRes = listed.map((r: any) => ({
       uri: String(r.uri),
       name: typeof r.name === "string" ? r.name : undefined,
       description:
@@ -117,15 +139,15 @@ export async function chatHandler(req: Request, res: Response) {
       mimeType: typeof r.mimeType === "string" ? r.mimeType : undefined,
     }));
 
-    // force include overview/tools if present
+    // Force include overview/tools if present
     const forced = new Set<string>(
       allRes
         .filter(
-          (r: MCPResourceMeta) =>
+          (r: any) =>
             r.uri === "integritas://docs/overview" ||
             r.uri === "integritas://docs/tools"
         )
-        .map((r: MCPResourceMeta) => r.uri)
+        .map((r: any) => r.uri)
     );
     const picks = pickRelevantResources(userText, allRes, 4);
     const uris = Array.from(new Set<string>([...Array.from(forced), ...picks]));
@@ -140,7 +162,7 @@ export async function chatHandler(req: Request, res: Response) {
     ].join("\n");
 
     try {
-      const docsResult = await adapter.run(body.messages, {
+      const docsResult = await adapter.run(chatMessages, {
         model: undefined,
         tools: [] as ToolCatalogItem[],
         systemPrompt: docsSystemPrompt,
@@ -155,15 +177,15 @@ export async function chatHandler(req: Request, res: Response) {
         requestId: rid,
         userId,
         finalText: docsResult.text ?? "Here’s what I found.",
+        links: [],
         sources: uris,
         tool_steps: [],
       });
     } catch (err: any) {
       const info = classifyLLMError(err);
-
       if (info.isLLMTransport) {
         const msg =
-          info.message ??
+          (info as any).message ??
           (info.isRateLimit
             ? `Model is rate limited${
                 info.retryAfter ? ` (retry after ~${info.retryAfter}s)` : ""
@@ -171,31 +193,30 @@ export async function chatHandler(req: Request, res: Response) {
             : `Model backend is unavailable${
                 info.status ? ` (HTTP ${info.status})` : ""
               }.`);
-
         return res.json({
           requestId: rid,
           userId,
           finalText: msg,
+          links: [],
           tool_steps: [],
         });
       }
-      // Not an LLM transport error → let your normal error handling take it
-      throw err;
+      throw err; // non-LLM error: surface it (use your global error handler)
     }
-  } else {
-    console.log("Is chat question?", false);
   }
 
-  console.log("Call for tool!");
+  /* --------------------------- Tool execution path --------------------------- */
 
-  // Prepare tool caller (with API-key injection + tracing)
+  // Prepare tool caller (inject API key + capture trace)
   const { callTool, trace } = createToolCaller(
     mcpClient,
     apiKey,
     body.toolArgs || {}
   );
 
-  // Host fallback: stamp directly if obvious
+  // Host fallbacks: directly execute common intents without LLM round-trips
+
+  // A) STAMP fallback
   const wantStamp =
     toolsInScope.some((t) => t.name === "stamp_data") &&
     (body.toolArgs?.stamp_data?.req ||
@@ -210,16 +231,8 @@ export async function chatHandler(req: Request, res: Response) {
     }
     const out = await callTool("stamp_data", args);
     const text =
-      (out as any)?.structuredContent?.summary ??
-      (out as any)?.summary ??
-      ((out as any)?.isError ? "Stamp failed." : "Stamp complete.");
-
-    const links =
-      out?.structuredContent?.links ??
-      // TEMP back-compat if old servers still send top-level URLs:
-      (out?.proof_url
-        ? [{ rel: "proof", href: out.proof_url, label: "Download proof" }]
-        : undefined);
+      out?.structuredContent?.summary ?? out?.summary ?? "Stamp complete.";
+    const links = extractLinksFromResult(out);
 
     return res.json({
       requestId: rid,
@@ -230,28 +243,14 @@ export async function chatHandler(req: Request, res: Response) {
     });
   }
 
-  // Host fallback: verify directly if obvious
-
+  // B) VERIFY fallback (explicit args present)
   if (body.toolArgs?.verify_data?.req) {
     const out = await callTool("verify_data", body.toolArgs.verify_data);
     const text =
-      (out as any)?.structuredContent?.summary ??
-      (out as any)?.summary ??
-      ((out as any)?.isError
-        ? "Verification failed."
-        : "Verification complete.");
-
-    const links =
-      out?.structuredContent?.links ??
-      (out?.verification_url
-        ? [
-            {
-              rel: "verification",
-              href: out.verification_url,
-              label: "View verification",
-            },
-          ]
-        : undefined);
+      out?.structuredContent?.summary ??
+      out?.summary ??
+      "Verification complete.";
+    const links = extractLinksFromResult(out);
 
     return res.json({
       requestId: rid,
@@ -262,9 +261,8 @@ export async function chatHandler(req: Request, res: Response) {
     });
   }
 
+  // Ensure requested tools are scopped if args mentioned
   const toolArgs = body.toolArgs || {};
-
-  // Force-scope stamp if args present (existing)
   if (
     toolArgs.stamp_data?.req &&
     !toolsInScope.find((t) => t.name === "stamp_data")
@@ -278,19 +276,17 @@ export async function chatHandler(req: Request, res: Response) {
       name: "stamp_data",
     });
   }
-
-  // Force-scope verify if args present
   if (
-    toolArgs.verify_data_with_proof?.req &&
-    !toolsInScope.find((t) => t.name === "verify_data_with_proof")
+    toolArgs.verify_data?.req &&
+    !toolsInScope.find((t) => t.name === "verify_data")
   ) {
-    const extra = allTools.find((t) => t.name === "verify_data_with_proof");
+    const extra = allTools.find((t) => t.name === "verify_data");
     if (extra) toolsInScope.push(extra);
     log.debug({
       event: "tools_in_scope_forced",
       requestId: rid,
       reason: "toolArgs present",
-      name: "verify_data_with_proof",
+      name: "verify_data",
     });
   }
 
@@ -308,8 +304,8 @@ export async function chatHandler(req: Request, res: Response) {
   });
 
   try {
-    // Run model with scoped tools
-    const result = await adapter.run(body.messages, {
+    // Let the LLM decide tool usage within the scoped list
+    const result = await adapter.run(chatMessages, {
       model: undefined,
       tools: toolsInScope,
       systemPrompt,
@@ -318,43 +314,16 @@ export async function chatHandler(req: Request, res: Response) {
       responseAsJson: true,
     });
 
-    console.log("Result:", result);
-
-    // Decorate steps a bit for UI + logs
-    for (const s of result.steps) {
-      const ids = pluckIdsFromContent(s.result);
-      if (ids.tx_id || ids.uid) Object.assign(s, ids);
-    }
-
-    const compactSteps = result.steps.map((s) => ({
-      name: s.name,
-      ok: !(s as any).isError,
-      uid: (s as any).uid,
-      tx_id: (s as any).tx_id,
-      summary:
-        (s.result as any)?.structuredContent?.summary ??
-        (s.result as any)?.summary ??
-        undefined,
-      sample: clamp(s.result, 400),
-    }));
-
     log.debug(
       { event: "tool_trace", requestId: rid, trace },
       "per-call tool trace"
     );
 
-    // Final text (prefer model JSON; else last primary step)
-    const finalText = finalizeText(result, result.steps);
-
-    const links = result.steps
-      .flatMap((s) => (s.result as any)?.structuredContent?.links ?? [])
-      .filter(Boolean)
+    // Final plain text and links for the client
+    const finalText = finalizeTextFromSteps(result);
+    const links = (result.steps ?? [])
+      .flatMap((s: any) => extractLinksFromResult(s.result))
       .slice(0, 5);
-
-    log.info(
-      { event: "chat_complete", userId, requestId: rid, steps: compactSteps },
-      "chat complete"
-    );
 
     return res.json({
       requestId: rid,
@@ -368,7 +337,7 @@ export async function chatHandler(req: Request, res: Response) {
 
     if (info.isLLMTransport) {
       const msg =
-        info.message ??
+        (info as any).message ??
         (info.isRateLimit
           ? `Model is rate limited${
               info.retryAfter ? ` (retry after ~${info.retryAfter}s)` : ""
@@ -376,16 +345,16 @@ export async function chatHandler(req: Request, res: Response) {
           : `Model backend is unavailable${
               info.status ? ` (HTTP ${info.status})` : ""
             }.`);
-
+      // Return 200 so UI can render a friendly message
       return res.json({
         requestId: rid,
         userId,
         finalText: msg,
+        links: [],
         tool_steps: [],
       });
     }
 
-    // Not an LLM transport error -> propagate (likely an MCP/tool path issue you want to surface)
-    throw err;
+    throw err; // Non-transport exceptions should be visible in your logs/monitoring
   }
 }

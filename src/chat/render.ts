@@ -58,16 +58,16 @@
 //   return finalText ?? "Done.";
 // }
 
-export function finalizeText(result: any, steps: any[]) {
-  // If the model returned a final text, keep it
-  if (result?.text && typeof result.text === "string") return result.text;
+// export function finalizeText(result: any, steps: any[]) {
+//   // If the model returned a final text, keep it
+//   if (result?.text && typeof result.text === "string") return result.text;
 
-  // Otherwise, prefer the last envelope summary
-  const lastSummary =
-    [...(steps || [])]
-      .reverse()
-      .map((s) => s?.result?.structuredContent?.summary ?? s?.result?.summary)
-      .find(Boolean) || "";
+//   // Otherwise, prefer the last envelope summary
+//   const lastSummary =
+//     [...(steps || [])]
+//       .reverse()
+//       .map((s) => s?.result?.structuredContent?.summary ?? s?.result?.summary)
+//       .find(Boolean) || "";
 
-  return lastSummary || "Done.";
-}
+//   return lastSummary || "Done.";
+// }

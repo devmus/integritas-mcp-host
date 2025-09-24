@@ -55,21 +55,20 @@ export function createToolCaller(
 
     const t0 = Date.now();
     try {
-      const out = await mcpClient.callTool({ name, arguments: merged });
+      // NEW: explicit per-call timeout + reset on progress (if your server emits progress)
+      const out = await mcpClient.callTool(
+        { name, arguments: merged },
+        /* result schema */ undefined,
+        /* request options */ {
+          timeout: 120_000, // 2 minutes (SDKs report this as e.data.timeout)
+          timeoutMs: 120_000, // for older builds that expect timeoutMs
+          resetTimeoutOnProgress: true, // keep alive if the server streams progress
+        }
+      );
+
       const ms = Date.now() - t0;
       const summary = summarizeToolResult(out);
       trace.push({ name, ms, args: safeArgs, ok: true, result: summary });
-
-      // log.info(
-      //   {
-      //     event: "tool_result",
-      //     tool: name,
-      //     ms,
-      //     summary: summary.summary,
-      //     sample: summary.raw,
-      //   },
-      //   "tool completed"
-      // );
       console.log("Tool caller completed");
       return out;
     } catch (e: any) {
@@ -78,22 +77,20 @@ export function createToolCaller(
       const code = e?.code ?? e?.data?.code;
       const timeoutMs: number | undefined = e?.data?.timeout;
 
-      // >>> Special-case: MCP SDK timeout (-32001)
       if (code === -32001 || /request timed out/i.test(errMsg)) {
+        const effective = timeoutMs ?? 120_000; // reflect our per-call timeout
         const friendly = {
           isError: true,
-          // give the UI a consistent place to read from
           structuredContent: {
             summary: `The "${name}" tool timed out after ${Math.round(
-              (timeoutMs ?? 60000) / 1000
+              effective / 1000
             )}s.`,
           },
           summary: `The "${name}" tool timed out after ${Math.round(
-            (timeoutMs ?? 60000) / 1000
+            effective / 1000
           )}s.`,
-          error: { code: -32001, timeout_ms: timeoutMs ?? 60000 },
+          error: { code: -32001, timeout_ms: effective },
         };
-
         const summary = summarizeToolResult(friendly);
         trace.push({
           name,
@@ -104,12 +101,9 @@ export function createToolCaller(
           error: errMsg,
         });
         console.log("Tool caller timeout");
-
-        // Return (not throw) so caller can display it
-        return friendly;
+        return friendly; // do not throw; let the UI render
       }
 
-      // Other tool errors: keep current behavior (bubble up)
       trace.push({ name, ms, args: safeArgs, ok: false, error: errMsg });
       console.log("Tool caller error");
       throw e;
